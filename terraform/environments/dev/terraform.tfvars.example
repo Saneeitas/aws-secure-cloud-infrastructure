@@ -1,0 +1,24 @@
+# Example variable values for the dev environment.
+# Copy this file to terraform.tfvars and replace placeholder values with real ones.
+#
+# Usage:
+#   cp terraform.tfvars.example terraform.tfvars
+#   # Edit terraform.tfvars with your actual values
+#   terraform init && terraform plan
+
+# Owner tag - your name or team identifier
+owner = "security-team"
+
+# KMS key admin principals - IAM ARNs that can manage (but not use) the key
+kms_admin_arns = ["arn:aws:iam::123456789012:role/admin"]
+
+# S3 bucket configuration
+s3_bucket_name                  = "my-org-secure-data-dev"
+allowed_principal_arns          = ["arn:aws:iam::123456789012:role/app-role"]
+inventory_destination_bucket_arn = "arn:aws:s3:::my-org-inventory-bucket"
+
+# Compute - SSH access restriction
+allowed_ssh_cidr = "203.0.113.0/24"
+
+# Monitoring - alert notifications
+notification_email = "security-alerts@example.com"
