@@ -1,0 +1,141 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  KMS Encryption Stack — customer-managed symmetric key with automatic
+  annual rotation and a least-privilege key policy separating admin
+  actions from usage (encrypt/decrypt) actions.
+
+# ===========================================================================
+# PARAMETERS
+# ===========================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: aws-secure-infrastructure
+    Description: Project name used in resource naming and tagging.
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name for tagging and naming.
+
+  Owner:
+    Type: String
+    Description: Owner identifier for resource tagging.
+
+  KeyDescription:
+    Type: String
+    Default: "Customer-managed KMS key for encrypting sensitive resources"
+    Description: Description for the KMS key.
+
+  AdminPrincipalArns:
+    Type: CommaDelimitedList
+    Description: >
+      Comma-separated IAM principal ARNs granted key administration actions
+      (e.g., arn:aws:iam::123456789012:role/admin).
+
+  UsagePrincipalArns:
+    Type: CommaDelimitedList
+    Description: >
+      Comma-separated IAM principal ARNs granted key usage actions
+      (encrypt/decrypt). At least one is required.
+
+# ===========================================================================
+# RESOURCES
+# ===========================================================================
+Resources:
+
+  # Customer-managed symmetric KMS key with annual rotation.
+  # Rotation ensures compromised key material has limited blast radius
+  # because AWS generates new backing key material each year while
+  # retaining old material for decryption of previously encrypted data.
+  KmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Ref KeyDescription
+      Enabled: true
+      EnableKeyRotation: true
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyUsage: ENCRYPT_DECRYPT
+      # Key policy separates administrative actions (lifecycle management)
+      # from usage actions (cryptographic operations). Administrators can
+      # manage the key but not encrypt/decrypt; usage principals can
+      # encrypt/decrypt but cannot modify or delete the key.
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: key-policy-1
+        Statement:
+          # Root account access — enables IAM policy-based delegation
+          - Sid: EnableRootAccountFullAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          # Administrative actions — key lifecycle management only
+          - Sid: AllowKeyAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Ref AdminPrincipalArns
+            Action:
+              - "kms:Create*"
+              - "kms:Describe*"
+              - "kms:Enable*"
+              - "kms:List*"
+              - "kms:Put*"
+              - "kms:Update*"
+              - "kms:Revoke*"
+              - "kms:Disable*"
+              - "kms:Get*"
+              - "kms:Delete*"
+              - "kms:TagResource"
+              - "kms:UntagResource"
+              - "kms:ScheduleKeyDeletion"
+              - "kms:CancelKeyDeletion"
+            Resource: "*"
+          # Usage actions — cryptographic operations only.
+          # These principals can encrypt/decrypt but cannot modify or
+          # delete the key itself.
+          - Sid: AllowKeyUsage
+            Effect: Allow
+            Principal:
+              AWS: !Ref UsagePrincipalArns
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey"
+            Resource: "*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Human-friendly alias for the key
+  KmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-key"
+      TargetKeyId: !Ref KmsKey
+
+# ===========================================================================
+# OUTPUTS
+# ===========================================================================
+Outputs:
+  KeyArn:
+    Description: ARN of the customer-managed KMS key
+    Value: !GetAtt KmsKey.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-KeyArn"
+
+  KeyId:
+    Description: ID of the customer-managed KMS key
+    Value: !Ref KmsKey
+    Export:
+      Name: !Sub "${AWS::StackName}-KeyId"

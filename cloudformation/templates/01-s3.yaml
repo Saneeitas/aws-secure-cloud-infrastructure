@@ -1,0 +1,192 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  S3 Data Protection Stack — private bucket with public access blocked,
+  least-privilege bucket policy, versioning, SSE-KMS encryption, access
+  logging to a dedicated log bucket, and weekly inventory reporting.
+
+# ===========================================================================
+# PARAMETERS
+# ===========================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: aws-secure-infrastructure
+    Description: Project name used in resource naming and tagging.
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name for tagging and naming.
+
+  Owner:
+    Type: String
+    Description: Owner identifier for resource tagging (e.g., security-team).
+
+  BucketName:
+    Type: String
+    Description: Globally unique name for the primary S3 bucket.
+
+  KmsKeyArn:
+    Type: String
+    Description: ARN of the KMS key for SSE-KMS encryption (from 03-kms stack output).
+
+  AllowedPrincipalArns:
+    Type: CommaDelimitedList
+    Description: >
+      Comma-separated list of IAM principal ARNs allowed to access the bucket
+      (e.g., arn:aws:iam::123456789012:role/app-role).
+
+  InventoryDestinationBucketArn:
+    Type: String
+    Description: ARN of the S3 bucket to receive weekly inventory reports.
+
+# ===========================================================================
+# RESOURCES
+# ===========================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # PRIMARY BUCKET
+  # ---------------------------------------------------------------------------
+  PrimaryBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      # SSE-KMS with bucket keys reduces KMS API call costs by caching the
+      # data encryption key at the bucket level instead of per-object.
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: "aws:kms"
+              KMSMasterKeyID: !Ref KmsKeyArn
+            BucketKeyEnabled: true
+      # Versioning protects against accidental deletion and provides an
+      # audit trail of object changes for forensic analysis.
+      VersioningConfiguration:
+        Status: Enabled
+      # Block all public access — defense-in-depth ensuring the bucket
+      # cannot be made public even if a permissive policy is attached.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Access logging records all requests for security auditing and
+      # incident investigation.
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LogBucket
+        LogFilePrefix: "access-logs/"
+      # Weekly inventory for asset visibility across all object versions.
+      InventoryConfigurations:
+        - Id: weekly-full-inventory
+          Enabled: true
+          Destination:
+            BucketArn: !Ref InventoryDestinationBucketArn
+            Format: CSV
+            Prefix: !Sub "inventory/${BucketName}/"
+          IncludedObjectVersions: All
+          ScheduleFrequency: Weekly
+          OptionalFields:
+            - Size
+            - LastModifiedDate
+            - StorageClass
+            - ETag
+            - IsMultipartUploaded
+            - ReplicationStatus
+            - EncryptionStatus
+            - ObjectLockRetainUntilDate
+            - ObjectLockMode
+            - ObjectLockLegalHoldStatus
+            - IntelligentTieringAccessTier
+            - BucketKeyStatus
+            - ChecksumAlgorithm
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Bucket policy implements least-privilege: explicit deny for unauthorized
+  # principals and explicit allow for only specific actions.
+  PrimaryBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref PrimaryBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyUnauthorizedAccess
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt PrimaryBucket.Arn
+              - !Sub "${PrimaryBucket.Arn}/*"
+            Condition:
+              StringNotLike:
+                "aws:PrincipalArn": !Ref AllowedPrincipalArns
+          - Sid: AllowAuthorizedAccess
+            Effect: Allow
+            Principal:
+              AWS: !Ref AllowedPrincipalArns
+            Action:
+              - "s3:GetObject"
+              - "s3:PutObject"
+              - "s3:ListBucket"
+            Resource:
+              - !GetAtt PrimaryBucket.Arn
+              - !Sub "${PrimaryBucket.Arn}/*"
+
+  # ---------------------------------------------------------------------------
+  # LOG BUCKET — receives server access logs from the primary bucket
+  # ---------------------------------------------------------------------------
+  LogBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${BucketName}-access-logs"
+      # Block all public access on log bucket as well.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Enforce bucket owner full control — disables ACLs.
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# ===========================================================================
+# OUTPUTS
+# ===========================================================================
+Outputs:
+  BucketName:
+    Description: Name of the primary hardened S3 bucket
+    Value: !Ref PrimaryBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-BucketName"
+
+  BucketArn:
+    Description: ARN of the primary S3 bucket
+    Value: !GetAtt PrimaryBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-BucketArn"
+
+  LogBucketName:
+    Description: Name of the S3 access logging bucket
+    Value: !Ref LogBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-LogBucketName"

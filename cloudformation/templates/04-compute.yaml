@@ -1,0 +1,230 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Compute Stack — EC2 instance with KMS-encrypted root volume, IMDSv2
+  enforced, least-privilege IAM instance profile (CloudWatch Logs + SSM),
+  and a security group restricting SSH to an explicit CIDR.
+
+# ===========================================================================
+# PARAMETERS
+# ===========================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: aws-secure-infrastructure
+    Description: Project name used in resource naming and tagging.
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name for tagging and naming.
+
+  Owner:
+    Type: String
+    Description: Owner identifier for resource tagging.
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    # Cost note: t3.micro is eligible for the AWS free tier (750 hrs/month
+    # for the first 12 months). Larger types incur compute charges.
+    Description: EC2 instance type (default t3.micro for free tier eligibility).
+
+  NetworkStackName:
+    Type: String
+    Description: Name of the 02-network stack to import VPC/subnet values from.
+
+  KmsStackName:
+    Type: String
+    Description: Name of the 03-kms stack to import the KMS key ARN from.
+
+  AllowedSshCidr:
+    Type: String
+    NoEcho: true
+    # No default — forces deployer to explicitly provide their trusted network.
+    Description: >
+      CIDR block allowed to SSH into the instance (e.g., 203.0.113.0/24).
+      No default to prevent accidental 0.0.0.0/0 exposure.
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: SSM parameter path for latest Amazon Linux 2023 AMI.
+
+# ===========================================================================
+# RESOURCES
+# ===========================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # SECURITY GROUP
+  # SSH restricted to explicit CIDR only — never use 0.0.0.0/0 for SSH
+  # as it exposes the instance to brute-force attacks from the internet.
+  # ---------------------------------------------------------------------------
+  ComputeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Compute SG - SSH restricted to allowed CIDR only"
+      VpcId:
+        Fn::ImportValue: !Sub "${NetworkStackName}-VpcId"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedSshCidr
+          Description: "SSH from allowed CIDR only"
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+          Description: "Allow all outbound traffic"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-compute-sg"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # IAM INSTANCE PROFILE — Least-privilege role
+  # Grants only CloudWatch Logs publishing and SSM agent communication.
+  # No S3, EC2, or other broad permissions included.
+  # ---------------------------------------------------------------------------
+  ComputeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-compute-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: cloudwatch-logs-publish
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowCloudWatchLogsPublishing
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                # Wildcard on log-group name is required because the CloudWatch
+                # agent creates groups based on its JSON config — names are not
+                # known at deploy time.
+                # Ref: https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/iam-identity-based-access-control-cwl.html
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+        - PolicyName: ssm-agent-communication
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowSSMAgentCommunication
+                Effect: Allow
+                Action:
+                  - "ssm:UpdateInstanceInformation"
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:*"
+              - Sid: AllowSSMMessaging
+                Effect: Allow
+                Action:
+                  - "ssmmessages:CreateControlChannel"
+                  - "ssmmessages:CreateDataChannel"
+                  - "ssmmessages:OpenControlChannel"
+                  - "ssmmessages:OpenDataChannel"
+                # Wildcard resource required — SSM messaging channels are
+                # dynamic and their ARNs cannot be predicted at deploy time.
+                # Ref: https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-getting-started-instance-profile.html
+                Resource: "*"
+              - Sid: AllowEC2Messaging
+                Effect: Allow
+                Action:
+                  - "ec2messages:AcknowledgeMessage"
+                  - "ec2messages:DeleteMessage"
+                  - "ec2messages:FailMessage"
+                  - "ec2messages:GetEndpoint"
+                  - "ec2messages:GetMessages"
+                  - "ec2messages:SendReply"
+                # Wildcard resource required — EC2 message channels are
+                # service-managed and ARNs are not predictable.
+                # Ref: https://docs.aws.amazon.com/systems-manager/latest/userguide/setup-instance-permissions.html
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  ComputeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${ProjectName}-compute-profile"
+      Roles:
+        - !Ref ComputeRole
+
+  # ---------------------------------------------------------------------------
+  # EC2 INSTANCE
+  # Encrypted root volume using customer-managed KMS key ensures
+  # data-at-rest protection for the OS disk.
+  # ---------------------------------------------------------------------------
+  ComputeInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId:
+        Fn::ImportValue: !Sub "${NetworkStackName}-WorkloadSubnetId"
+      SecurityGroupIds:
+        - !Ref ComputeSecurityGroup
+      IamInstanceProfile: !Ref ComputeInstanceProfile
+      # IMDSv2 enforced — prevents SSRF-based credential theft by requiring
+      # a session token for metadata access.
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+        HttpPutResponseHopLimit: 1
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 20
+            Encrypted: true
+            KmsKeyId:
+              Fn::ImportValue: !Sub "${KmsStackName}-KeyArn"
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-compute-instance"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# ===========================================================================
+# OUTPUTS
+# ===========================================================================
+Outputs:
+  InstanceId:
+    Description: ID of the EC2 compute instance
+    Value: !Ref ComputeInstance
+    Export:
+      Name: !Sub "${AWS::StackName}-InstanceId"
+
+  SecurityGroupId:
+    Description: ID of the compute security group
+    Value: !Ref ComputeSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-SecurityGroupId"

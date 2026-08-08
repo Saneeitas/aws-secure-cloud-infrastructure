@@ -1,0 +1,47 @@
+{
+  "01-s3": {
+    "ProjectName": "aws-secure-infrastructure",
+    "Environment": "dev",
+    "Owner": "security-team",
+    "BucketName": "my-org-secure-data-dev",
+    "KmsKeyArn": "arn:aws:kms:us-east-1:123456789012:key/example-key-id",
+    "AllowedPrincipalArns": "arn:aws:iam::123456789012:role/app-role",
+    "InventoryDestinationBucketArn": "arn:aws:s3:::my-org-inventory-bucket"
+  },
+  "02-network": {
+    "ProjectName": "aws-secure-infrastructure",
+    "Environment": "dev",
+    "Owner": "security-team",
+    "VpcCidr": "10.0.0.0/16",
+    "ManagementSubnetCidr": "10.0.1.0/24",
+    "WorkloadSubnetCidr": "10.0.2.0/24",
+    "DeployNetworkFirewall": "false",
+    "FirewallDropPort": "8080"
+  },
+  "03-kms": {
+    "ProjectName": "aws-secure-infrastructure",
+    "Environment": "dev",
+    "Owner": "security-team",
+    "KeyDescription": "Customer-managed KMS key for encrypting sensitive resources",
+    "AdminPrincipalArns": "arn:aws:iam::123456789012:role/admin",
+    "UsagePrincipalArns": "arn:aws:iam::123456789012:role/app-role"
+  },
+  "04-compute": {
+    "ProjectName": "aws-secure-infrastructure",
+    "Environment": "dev",
+    "Owner": "security-team",
+    "InstanceType": "t3.micro",
+    "NetworkStackName": "secure-infra-network",
+    "KmsStackName": "secure-infra-kms",
+    "AllowedSshCidr": "203.0.113.0/24"
+  },
+  "05-monitoring": {
+    "ProjectName": "aws-secure-infrastructure",
+    "Environment": "dev",
+    "Owner": "security-team",
+    "S3StackName": "secure-infra-s3",
+    "KmsStackName": "secure-infra-kms",
+    "ComputeStackName": "secure-infra-compute",
+    "NotificationEmail": "security-alerts@example.com"
+  }
+}

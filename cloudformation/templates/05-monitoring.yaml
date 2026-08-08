@@ -1,0 +1,398 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Monitoring & Compliance Stack — CloudTrail with S3 data events,
+  CloudWatch Log Group + SSH brute-force metric filter + alarm,
+  SNS notifications, AWS Config rule with auto-remediation, and
+  KMS-encrypted Secrets Manager secret.
+
+# ===========================================================================
+# PARAMETERS
+# ===========================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: aws-secure-infrastructure
+    Description: Project name used in resource naming and tagging.
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name for tagging and naming.
+
+  Owner:
+    Type: String
+    Description: Owner identifier for resource tagging.
+
+  S3StackName:
+    Type: String
+    Description: Name of the 01-s3 stack to import bucket ARN/name from.
+
+  KmsStackName:
+    Type: String
+    Description: Name of the 03-kms stack to import the KMS key ARN from.
+
+  ComputeStackName:
+    Type: String
+    Description: Name of the 04-compute stack to import instance ID from.
+
+  NotificationEmail:
+    Type: String
+    NoEcho: true
+    Description: >
+      Email address for SNS alarm notifications (e.g., security-alerts@example.com).
+      No default — must be provided.
+
+# ===========================================================================
+# RESOURCES
+# ===========================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # CLOUDTRAIL — S3 Data Event Logging
+  # Captures all S3 API activity on the primary bucket for forensic analysis
+  # and compliance evidence. Data events provide object-level visibility.
+  # ---------------------------------------------------------------------------
+  CloudTrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/cloudtrail/${ProjectName}"
+      RetentionInDays: 90
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  CloudTrailRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-cloudtrail-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: cloudtrail-cloudwatch-logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowCloudTrailLogsPublishing
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !Sub "${CloudTrailLogGroup.Arn}:*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # S3 bucket for CloudTrail log storage
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-cloudtrail-logs-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: "s3:GetBucketAcl"
+            Resource: !GetAtt CloudTrailBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: "s3:PutObject"
+            Resource: !Sub "${CloudTrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                "s3:x-amz-acl": "bucket-owner-full-control"
+
+  Trail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailBucketPolicy
+    Properties:
+      TrailName: !Sub "${ProjectName}-trail"
+      S3BucketName: !Ref CloudTrailBucket
+      IsLogging: true
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: false
+      CloudWatchLogsLogGroupArn: !GetAtt CloudTrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailRole.Arn
+      # S3 data events capture object-level API activity (GetObject, PutObject)
+      # providing full visibility into data access patterns.
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: AWS::S3::Object
+              Values:
+                - !Sub
+                  - "${BucketArn}/"
+                  - BucketArn:
+                      Fn::ImportValue: !Sub "${S3StackName}-BucketArn"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-trail"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # CLOUDWATCH LOG GROUP — OS-level logs from EC2 instance
+  # 90-day retention for compliance and incident response timelines.
+  # ---------------------------------------------------------------------------
+  OsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/ec2/${ProjectName}/os-logs"
+      RetentionInDays: 90
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # METRIC FILTER AND ALARM — SSH Brute Force Detection
+  # Detects failed SSH login attempts indicating potential brute-force attacks.
+  # ---------------------------------------------------------------------------
+  SshFailureMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref OsLogGroup
+      FilterPattern: "\"Invalid user\" OR \"Failed password\""
+      MetricTransformations:
+        - MetricNamespace: !Sub "${ProjectName}/Security"
+          MetricName: SSHFailedLogins
+          MetricValue: "1"
+
+  SshBruteForceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-ssh-brute-force"
+      AlarmDescription: >
+        Triggers when more than 5 failed SSH login attempts occur within 5 minutes.
+      Namespace: !Sub "${ProjectName}/Security"
+      MetricName: SSHFailedLogins
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  # ---------------------------------------------------------------------------
+  # SNS TOPIC — Alarm Notifications
+  # ---------------------------------------------------------------------------
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-security-alerts"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  AlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ---------------------------------------------------------------------------
+  # AWS CONFIG RULE — S3 Bucket Logging Compliance
+  # Evaluates whether the primary S3 bucket has logging enabled.
+  # ---------------------------------------------------------------------------
+  S3LoggingConfigRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: s3-bucket-logging-enabled
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_LOGGING_ENABLED
+      Scope:
+        ComplianceResourceTypes:
+          - "AWS::S3::Bucket"
+        ComplianceResourceId:
+          Fn::ImportValue: !Sub "${S3StackName}-BucketName"
+
+  # Auto-remediation using SSM Automation to re-enable logging when Config
+  # evaluates as NON_COMPLIANT — automated security drift correction.
+  ConfigRemediationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-config-remediation-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: config-remediation-s3-logging
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:PutBucketLogging"
+                  - "s3:GetBucketLogging"
+                Resource:
+                  - Fn::ImportValue: !Sub "${S3StackName}-BucketArn"
+                  - !Sub
+                    - "${BucketArn}-access-logs"
+                    - BucketArn:
+                        Fn::ImportValue: !Sub "${S3StackName}-BucketArn"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  S3LoggingRemediation:
+    Type: AWS::Config::RemediationConfiguration
+    Properties:
+      ConfigRuleName: !Ref S3LoggingConfigRule
+      TargetType: SSM_DOCUMENT
+      TargetId: AWS-ConfigureS3BucketLogging
+      Automatic: true
+      MaximumAutomaticAttempts: 3
+      RetryAttemptSeconds: 60
+      Parameters:
+        AutomationAssumeRole:
+          StaticValue:
+            Values:
+              - !GetAtt ConfigRemediationRole.Arn
+        BucketName:
+          ResourceValue:
+            Value: RESOURCE_ID
+        TargetBucket:
+          StaticValue:
+            Values:
+              - !Sub
+                - "${BucketName}-access-logs"
+                - BucketName:
+                    Fn::ImportValue: !Sub "${S3StackName}-BucketName"
+        TargetPrefix:
+          StaticValue:
+            Values:
+              - "access-logs/"
+
+  # ---------------------------------------------------------------------------
+  # SECRETS MANAGER — Encrypted secret demonstrating encryption-at-rest
+  # Uses the KMS key for encryption, providing:
+  # 1. Full control over key lifecycle and rotation
+  # 2. Audit trail via CloudTrail for all decrypt operations
+  # 3. Ability to revoke access by disabling or deleting the key
+  # ---------------------------------------------------------------------------
+  DemoSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}/demo-secret"
+      KmsKeyId:
+        Fn::ImportValue: !Sub "${KmsStackName}-KeyArn"
+      # Placeholder value demonstrating encryption-at-rest.
+      # In production, this would be populated by an external process.
+      SecretString: !Sub |
+        {"username":"demo-user","password":"REPLACE_WITH_ACTUAL_SECRET_VALUE","note":"Placeholder demonstrating KMS-encrypted secrets storage"}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+# ===========================================================================
+# OUTPUTS
+# ===========================================================================
+Outputs:
+  CloudTrailTrailArn:
+    Description: ARN of the CloudTrail trail
+    Value: !GetAtt Trail.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-TrailArn"
+
+  CloudWatchLogGroupName:
+    Description: CloudWatch Log Group name for OS-level logs
+    Value: !Ref OsLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-OsLogGroupName"
+
+  SnsTopicArn:
+    Description: ARN of the security alerts SNS topic
+    Value: !Ref AlertsTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-SnsTopicArn"
+
+  ConfigRuleArn:
+    Description: ARN of the S3 logging Config rule
+    Value: !GetAtt S3LoggingConfigRule.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ConfigRuleArn"
+
+  SecretArn:
+    Description: ARN of the KMS-encrypted Secrets Manager secret
+    Value: !Ref DemoSecret
+    Export:
+      Name: !Sub "${AWS::StackName}-SecretArn"

@@ -1,0 +1,568 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Network Security Stack — VPC with management and workload subnets,
+  deny-all NACLs, restrictive security groups, VPC Flow Logs, and an
+  optional AWS Network Firewall (gated by condition to avoid cost).
+
+# ===========================================================================
+# PARAMETERS
+# ===========================================================================
+Parameters:
+  ProjectName:
+    Type: String
+    Default: aws-secure-infrastructure
+    Description: Project name used in resource naming and tagging.
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name for tagging and naming.
+
+  Owner:
+    Type: String
+    Description: Owner identifier for resource tagging.
+
+  VpcCidr:
+    Type: String
+    Default: "10.0.0.0/16"
+    Description: CIDR block for the primary VPC.
+
+  ManagementSubnetCidr:
+    Type: String
+    Default: "10.0.1.0/24"
+    Description: CIDR block for the management subnet.
+
+  WorkloadSubnetCidr:
+    Type: String
+    Default: "10.0.2.0/24"
+    Description: CIDR block for the workload subnet.
+
+  DeployNetworkFirewall:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    # WARNING: AWS Network Firewall costs ~$0.395/hour (~$288/month) per
+    # endpoint plus data processing fees. Only set to "true" for production
+    # or when specifically testing firewall routing.
+    Description: >
+      Whether to deploy AWS Network Firewall (WARNING: ~$0.395/hr cost).
+      Default false to avoid unexpected charges.
+
+  FirewallDropPort:
+    Type: Number
+    Default: 8080
+    Description: TCP port to block in the Network Firewall stateful rules.
+
+# ===========================================================================
+# CONDITIONS
+# ===========================================================================
+Conditions:
+  EnableNetworkFirewall: !Equals [!Ref DeployNetworkFirewall, "true"]
+
+# ===========================================================================
+# RESOURCES
+# ===========================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # PRIMARY VPC
+  # ---------------------------------------------------------------------------
+  PrimaryVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-primary-vpc"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # SUBNETS
+  # ---------------------------------------------------------------------------
+  ManagementSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PrimaryVpc
+      CidrBlock: !Ref ManagementSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-management-subnet"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  WorkloadSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref PrimaryVpc
+      CidrBlock: !Ref WorkloadSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-workload-subnet"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # NETWORK ACLs — Deny-all by default
+  # NACLs provide stateless subnet-level filtering. Denying all traffic by
+  # default enforces explicit allow-listing, complementing security groups
+  # as a defense-in-depth measure.
+  # ---------------------------------------------------------------------------
+  ManagementNacl:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref PrimaryVpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-management-nacl"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Deny all inbound — explicit rules must be added for allowed traffic
+  ManagementNaclInboundDeny:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref ManagementNacl
+      RuleNumber: 100
+      Protocol: -1
+      RuleAction: deny
+      Egress: false
+      CidrBlock: "0.0.0.0/0"
+
+  # Deny all outbound — explicit rules must be added for allowed traffic
+  ManagementNaclOutboundDeny:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref ManagementNacl
+      RuleNumber: 100
+      Protocol: -1
+      RuleAction: deny
+      Egress: true
+      CidrBlock: "0.0.0.0/0"
+
+  ManagementNaclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref ManagementSubnet
+      NetworkAclId: !Ref ManagementNacl
+
+  WorkloadNacl:
+    Type: AWS::EC2::NetworkAcl
+    Properties:
+      VpcId: !Ref PrimaryVpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-workload-nacl"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  WorkloadNaclInboundDeny:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref WorkloadNacl
+      RuleNumber: 100
+      Protocol: -1
+      RuleAction: deny
+      Egress: false
+      CidrBlock: "0.0.0.0/0"
+
+  WorkloadNaclOutboundDeny:
+    Type: AWS::EC2::NetworkAclEntry
+    Properties:
+      NetworkAclId: !Ref WorkloadNacl
+      RuleNumber: 100
+      Protocol: -1
+      RuleAction: deny
+      Egress: true
+      CidrBlock: "0.0.0.0/0"
+
+  WorkloadNaclAssociation:
+    Type: AWS::EC2::SubnetNetworkAclAssociation
+    Properties:
+      SubnetId: !Ref WorkloadSubnet
+      NetworkAclId: !Ref WorkloadNacl
+
+  # ---------------------------------------------------------------------------
+  # SECURITY GROUPS — No ingress, allow-all egress by default
+  # Security groups are stateful instance-level firewalls. Starting with no
+  # ingress rules forces explicit rule creation for any inbound access.
+  # ---------------------------------------------------------------------------
+  ManagementSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Management subnet SG - no ingress by default"
+      VpcId: !Ref PrimaryVpc
+      # No ingress rules — all inbound denied by default
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+          Description: "Allow all outbound traffic"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-management-sg"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  WorkloadSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Workload subnet SG - no ingress by default"
+      VpcId: !Ref PrimaryVpc
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: "0.0.0.0/0"
+          Description: "Allow all outbound traffic"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-workload-sg"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # VPC FLOW LOGS
+  # Captures IP traffic metadata for network visibility, security monitoring,
+  # and incident response.
+  # ---------------------------------------------------------------------------
+  FlowLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/vpc/flow-logs/${PrimaryVpc}"
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  FlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-vpc-flow-logs-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: vpc-flow-logs-publish
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "logs:DescribeLogGroups"
+                  - "logs:DescribeLogStreams"
+                # Flow Logs creates dynamic log streams — wildcard on the log
+                # group ARN suffix is required by the service.
+                # Ref: https://docs.aws.amazon.com/vpc/latest/userguide/flow-logs-cwl.html
+                Resource: !Sub "${FlowLogGroup.Arn}:*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  VpcFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceId: !Ref PrimaryVpc
+      ResourceType: VPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Ref FlowLogGroup
+      DeliverLogsPermissionArn: !GetAtt FlowLogRole.Arn
+      MaxAggregationInterval: 60
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-flow-log"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # ---------------------------------------------------------------------------
+  # OPTIONAL: AWS NETWORK FIREWALL
+  # All resources below are conditional on DeployNetworkFirewall = "true".
+  # Cost: ~$0.395/hour (~$288/month) per endpoint + data processing fees.
+  # ---------------------------------------------------------------------------
+
+  # Separate VPC for firewall inspection — enforces a clear security boundary.
+  FirewallVpc:
+    Type: AWS::EC2::VPC
+    Condition: EnableNetworkFirewall
+    Properties:
+      CidrBlock: "10.1.0.0/16"
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-firewall-vpc"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  FirewallSubnet:
+    Type: AWS::EC2::Subnet
+    Condition: EnableNetworkFirewall
+    Properties:
+      VpcId: !Ref FirewallVpc
+      CidrBlock: "10.1.1.0/24"
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-firewall-subnet"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  FirewallInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Condition: EnableNetworkFirewall
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-firewall-igw"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  FirewallIgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Condition: EnableNetworkFirewall
+    Properties:
+      VpcId: !Ref FirewallVpc
+      InternetGatewayId: !Ref FirewallInternetGateway
+
+  # Stateful rule group: allows standard protocols, drops configured port.
+  # Demonstrates defense-in-depth by explicitly defining allowed traffic.
+  FirewallRuleGroup:
+    Type: AWS::NetworkFirewall::RuleGroup
+    Condition: EnableNetworkFirewall
+    Properties:
+      RuleGroupName: !Sub "${ProjectName}-stateful-rules"
+      Type: STATEFUL
+      Capacity: 100
+      RuleGroup:
+        RulesSource:
+          RulesString: !Sub |
+            # Allow HTTP traffic
+            pass tcp any any -> any 80 (msg:"Allow HTTP"; sid:1; rev:1;)
+            # Allow HTTPS traffic
+            pass tcp any any -> any 443 (msg:"Allow HTTPS"; sid:2; rev:1;)
+            # Allow SSH traffic
+            pass tcp any any -> any 22 (msg:"Allow SSH"; sid:3; rev:1;)
+            # Allow ICMP (ping)
+            pass icmp any any -> any any (msg:"Allow ICMP"; sid:4; rev:1;)
+            # Drop traffic on configured port
+            drop tcp any any -> any ${FirewallDropPort} (msg:"Drop blocked port"; sid:5; rev:1;)
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-stateful-rules"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  FirewallPolicy:
+    Type: AWS::NetworkFirewall::FirewallPolicy
+    Condition: EnableNetworkFirewall
+    Properties:
+      FirewallPolicyName: !Sub "${ProjectName}-firewall-policy"
+      FirewallPolicy:
+        StatelessDefaultActions:
+          - "aws:forward_to_sfe"
+        StatelessFragmentDefaultActions:
+          - "aws:forward_to_sfe"
+        StatefulRuleGroupReferences:
+          - ResourceArn: !Ref FirewallRuleGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-firewall-policy"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # AWS Network Firewall — inspects all traffic routed through it.
+  # Cost: ~$0.395/hour per endpoint + data processing fees.
+  NetworkFirewall:
+    Type: AWS::NetworkFirewall::Firewall
+    Condition: EnableNetworkFirewall
+    Properties:
+      FirewallName: !Sub "${ProjectName}-network-firewall"
+      FirewallPolicyArn: !Ref FirewallPolicy
+      VpcId: !Ref FirewallVpc
+      SubnetMappings:
+        - SubnetId: !Ref FirewallSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-network-firewall"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  # Route table for firewall subnet — egress via IGW
+  FirewallRouteTable:
+    Type: AWS::EC2::RouteTable
+    Condition: EnableNetworkFirewall
+    Properties:
+      VpcId: !Ref FirewallVpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-firewall-egress-rt"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Owner
+        - Key: ManagedBy
+          Value: CloudFormation
+
+  FirewallDefaultRoute:
+    Type: AWS::EC2::Route
+    Condition: EnableNetworkFirewall
+    DependsOn: FirewallIgwAttachment
+    Properties:
+      RouteTableId: !Ref FirewallRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref FirewallInternetGateway
+
+  FirewallSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Condition: EnableNetworkFirewall
+    Properties:
+      SubnetId: !Ref FirewallSubnet
+      RouteTableId: !Ref FirewallRouteTable
+
+# ===========================================================================
+# OUTPUTS
+# ===========================================================================
+Outputs:
+  VpcId:
+    Description: ID of the primary VPC
+    Value: !Ref PrimaryVpc
+    Export:
+      Name: !Sub "${AWS::StackName}-VpcId"
+
+  ManagementSubnetId:
+    Description: ID of the management subnet
+    Value: !Ref ManagementSubnet
+    Export:
+      Name: !Sub "${AWS::StackName}-ManagementSubnetId"
+
+  WorkloadSubnetId:
+    Description: ID of the workload subnet
+    Value: !Ref WorkloadSubnet
+    Export:
+      Name: !Sub "${AWS::StackName}-WorkloadSubnetId"
+
+  FlowLogGroupName:
+    Description: CloudWatch Log Group name for VPC Flow Logs
+    Value: !Ref FlowLogGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-FlowLogGroupName"
+
+  ManagementSecurityGroupId:
+    Description: ID of the management subnet security group
+    Value: !Ref ManagementSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-ManagementSgId"
+
+  WorkloadSecurityGroupId:
+    Description: ID of the workload subnet security group
+    Value: !Ref WorkloadSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-WorkloadSgId"
